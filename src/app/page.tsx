@@ -28,8 +28,35 @@ function parseHash(): Record<string, string> {
 
 type State = 'loading' | 'form' | 'success' | 'error';
 
+// Los dos flujos que Supabase manda a este puente. El copy es lo único que
+// cambia entre ellos: en ambos casos la sesión llega en el hash y se termina
+// con updateUser({ password }).
+type Flow = 'invite' | 'recovery';
+
+const COPY: Record<Flow, { title: string; subtitle: string; expired: string; invalid: string; done: string }> = {
+  invite: {
+    title: 'Crea tu contraseña',
+    subtitle: 'Has sido invitado a Trazea. Elige una contraseña para activar tu cuenta.',
+    expired:
+      'El enlace de invitación ha expirado. Contacta con el administrador para solicitar uno nuevo.',
+    invalid:
+      'El enlace de invitación ha expirado o no es válido. Contacta con el administrador para solicitar una nueva invitación.',
+    done: 'Tu cuenta está lista. Abre la app Trazea en tu móvil para acceder.',
+  },
+  recovery: {
+    title: 'Cambia tu contraseña',
+    subtitle: 'Elige una contraseña nueva para tu cuenta de Trazea.',
+    expired:
+      'El enlace para restablecer la contraseña ha expirado. Pide uno nuevo desde la pantalla de acceso de la app.',
+    invalid:
+      'El enlace para restablecer la contraseña ha expirado o no es válido. Pide uno nuevo desde la pantalla de acceso de la app.',
+    done: 'Tu contraseña se ha actualizado. Abre la app Trazea en tu móvil para entrar.',
+  },
+};
+
 export default function AuthPage() {
   const [state, setState] = useState<State>('loading');
+  const [flow, setFlow] = useState<Flow>('invite');
   const [errorMsg, setErrorMsg] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -60,10 +87,17 @@ export default function AuthPage() {
     (async () => {
       const params = parseHash();
 
-      if (!params.access_token || !params.refresh_token || params.type !== 'invite') {
+      if (
+        !params.access_token ||
+        !params.refresh_token ||
+        (params.type !== 'invite' && params.type !== 'recovery')
+      ) {
         setState('error');
         return;
       }
+
+      const kind = params.type as Flow;
+      setFlow(kind);
 
       const { error } = await supabase.auth.setSession({
         access_token: params.access_token,
@@ -71,9 +105,7 @@ export default function AuthPage() {
       });
 
       if (error) {
-        setErrorMsg(
-          'El enlace de invitación ha expirado. Contacta con el administrador para solicitar uno nuevo.'
-        );
+        setErrorMsg(COPY[kind].expired);
         setState('error');
         return;
       }
@@ -132,10 +164,8 @@ export default function AuthPage() {
       {state === 'form' && (
         <div className="card">
           <Image src="/logo.svg" alt="Trazea" width={120} height={32} className="logo" unoptimized />
-          <h1>Crea tu contraseña</h1>
-          <p className="subtitle">
-            Has sido invitado a Trazea. Elige una contraseña para activar tu cuenta.
-          </p>
+          <h1>{COPY[flow].title}</h1>
+          <p className="subtitle">{COPY[flow].subtitle}</p>
 
           <div className="field">
             <label htmlFor="password">Contraseña</label>
@@ -300,9 +330,7 @@ export default function AuthPage() {
             </svg>
           </div>
           <h1>¡Contraseña guardada!</h1>
-          <p className="subtitle">
-            Tu cuenta está lista. Abre la app Trazea en tu iPhone para acceder.
-          </p>
+          <p className="subtitle">{COPY[flow].done}</p>
 
           <a href={`${appScheme}://`} className="btn btn-green">
             <svg
@@ -348,10 +376,7 @@ export default function AuthPage() {
             </svg>
           </div>
           <h1>Enlace inválido</h1>
-          <p className="subtitle">
-            {errorMsg ||
-              'El enlace de invitación ha expirado o no es válido. Contacta con el administrador para solicitar una nueva invitación.'}
-          </p>
+          <p className="subtitle">{errorMsg || COPY[flow].invalid}</p>
         </div>
       )}
 
