@@ -2,7 +2,8 @@
 
 import Image from 'next/image';
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { supabase } from '@/lib/supabase';
+import { createEphemeralSupabase, getSupabase } from '@/lib/supabase';
+import { createBridgeRunner, type ActivationError, type PasswordFlow } from '@/lib/authBridge';
 
 const STRENGTH = [
   { pct: 0, color: '', label: '' },
@@ -12,26 +13,39 @@ const STRENGTH = [
   { pct: 100, color: '#1dba5d', label: 'Fuerte' },
 ];
 
-function parseHash(): Record<string, string> {
-  if (typeof window === 'undefined') return {};
-  const hash = window.location.hash.slice(1);
-  return Object.fromEntries(
-    hash
-      .split('&')
-      .filter(Boolean)
-      .map((p) => {
-        const i = p.indexOf('=');
-        return [p.slice(0, i), decodeURIComponent(p.slice(i + 1))];
-      })
-  );
-}
+type State = 'loading' | 'form' | 'success' | 'error' | 'signup-confirmed' | 'redirecting';
 
-type State = 'loading' | 'form' | 'success' | 'error';
+// Los dos flujos con contraseña que Supabase manda a este puente. El copy es lo
+// único que cambia entre ellos: en ambos casos la sesión llega en el hash y se
+// termina con updateUser({ password }).
+type Flow = PasswordFlow;
 
-// Los dos flujos que Supabase manda a este puente. El copy es lo único que
-// cambia entre ellos: en ambos casos la sesión llega en el hash y se termina
-// con updateUser({ password }).
-type Flow = 'invite' | 'recovery';
+// Una ejecución por carga de página (Strict Mode monta el efecto dos veces).
+const runBridge = createBridgeRunner();
+
+// Supabase redirige con #error=… sin decir de qué enlace se trataba.
+const LINK_USED =
+  'Este enlace ha caducado o ya se ha usado. Si ya completaste este paso, abre la app Trazea e inicia sesión. Si no, solicita un enlace nuevo.';
+
+const SIGNUP_FAILED =
+  'No hemos podido confirmar tu correo con este enlace: puede haber caducado o ya se ha usado. Si ya lo confirmaste, inicia sesión en la app; si no, pide que te reenvíe el email desde la pantalla de acceso.';
+
+const ACTIVATION_LINK =
+  'El enlace de activación ha caducado, ya se ha usado o no es válido. Vuelve a pedirlo desde la pantalla Activar de la app.';
+
+// Ningún mensaje afirma que se haya pagado: aquí nunca se llega a pagar.
+const ACTIVATION_ERRORS: Record<ActivationError, string> = {
+  link: ACTIVATION_LINK,
+  forbidden: 'Solo la persona administradora del negocio puede activar la suscripción.',
+  'pending-deletion':
+    'Tu cuenta tiene una baja programada. Cancélala desde la app antes de activar la suscripción.',
+  'not-trial':
+    'Esta cuenta no tiene una prueba pendiente de activar. Abre la app para ver el estado de tu suscripción.',
+  'rate-limited':
+    'Demasiados intentos seguidos. Espera unos minutos y vuelve a pedir el enlace desde la app.',
+  unavailable:
+    'No hemos podido abrir la página de pago y no se ha hecho ningún cobro. Vuelve a pedir el enlace desde la pantalla Activar de la app.',
+};
 
 const COPY: Record<Flow, { title: string; subtitle: string; expired: string; invalid: string; done: string }> = {
   invite: {
@@ -58,6 +72,7 @@ export default function AuthPage() {
   const [state, setState] = useState<State>('loading');
   const [flow, setFlow] = useState<Flow>('invite');
   const [errorMsg, setErrorMsg] = useState('');
+  const [errorTitle, setErrorTitle] = useState('Enlace inválido');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [showPw, setShowPw] = useState(false);
@@ -84,34 +99,51 @@ export default function AuthPage() {
   }, [password, calcStrength]);
 
   useEffect(() => {
-    (async () => {
-      const params = parseHash();
-
-      if (
-        !params.access_token ||
-        !params.refresh_token ||
-        (params.type !== 'invite' && params.type !== 'recovery')
-      ) {
-        setState('error');
-        return;
+    let active = true;
+    runBridge(() => ({
+      href: window.location.href,
+      clearUrl: () => window.history.replaceState(null, '', window.location.pathname),
+      passwordAuth: () => getSupabase().auth,
+      ephemeralAuth: () => createEphemeralSupabase().auth,
+      fetch: (...args) => window.fetch(...args),
+      navigate: (url) => window.location.replace(url),
+    })).then((outcome) => {
+      if (!active) return;
+      switch (outcome.view) {
+        case 'form':
+          setFlow(outcome.flow);
+          setState('form');
+          return;
+        case 'password-link-expired':
+          setFlow(outcome.flow);
+          setErrorMsg(COPY[outcome.flow].expired);
+          setState('error');
+          return;
+        case 'signup-confirmed':
+          setState('signup-confirmed');
+          return;
+        case 'redirecting':
+          setState('redirecting');
+          return;
+        case 'signup-failed':
+          setErrorMsg(SIGNUP_FAILED);
+          break;
+        case 'link-error':
+          setErrorMsg(outcome.activation ? ACTIVATION_LINK : LINK_USED);
+          break;
+        case 'invalid':
+          if (outcome.activation) setErrorMsg(ACTIVATION_LINK);
+          break;
+        case 'activation-failed':
+          if (outcome.error !== 'link') setErrorTitle('No se ha podido abrir el pago');
+          setErrorMsg(ACTIVATION_ERRORS[outcome.error]);
+          break;
       }
-
-      const kind = params.type as Flow;
-      setFlow(kind);
-
-      const { error } = await supabase.auth.setSession({
-        access_token: params.access_token,
-        refresh_token: params.refresh_token,
-      });
-
-      if (error) {
-        setErrorMsg(COPY[kind].expired);
-        setState('error');
-        return;
-      }
-
-      setState('form');
-    })();
+      setState('error');
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -133,7 +165,7 @@ export default function AuthPage() {
 
     setLoading(true);
 
-    const { error } = await supabase.auth.updateUser({ password });
+    const { error } = await getSupabase().auth.updateUser({ password });
 
     if (error) {
       setLoading(false);
@@ -356,6 +388,51 @@ export default function AuthPage() {
         </div>
       )}
 
+      {/* SIGNUP CONFIRMADO */}
+      {state === 'signup-confirmed' && (
+        <div className="card">
+          <Image src="/logo.svg" alt="Trazea" width={120} height={32} className="logo" unoptimized />
+          <div className="success-icon">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="26"
+              height="26"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="#16a34a"
+              strokeWidth="2.5"
+            >
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+          </div>
+          <h1>Email confirmado, vuelve a la app</h1>
+          <p className="subtitle">
+            Abre Trazea en tu móvil e inicia sesión con tu email y tu contraseña.
+          </p>
+
+          <a href={`${appScheme}://login`} className="btn btn-green">
+            Volver a Trazea
+          </a>
+
+          <hr className="divider" />
+          <p className="note">
+            Si el botón no abre la app, busca &quot;Trazea&quot; en tu móvil y ábrela
+            directamente.
+          </p>
+        </div>
+      )}
+
+      {/* ACTIVACIÓN: camino del Checkout */}
+      {state === 'redirecting' && (
+        <div className="card">
+          <Image src="/logo.svg" alt="Trazea" width={120} height={32} className="logo" unoptimized />
+          <h1>Abriendo la página de pago segura…</h1>
+          <p className="subtitle">
+            Te llevamos a Stripe para completar la activación. Cuando termines, vuelve a la app.
+          </p>
+        </div>
+      )}
+
       {/* ERROR */}
       {state === 'error' && (
         <div className="card">
@@ -375,7 +452,7 @@ export default function AuthPage() {
               <line x1="12" y1="16" x2="12.01" y2="16" />
             </svg>
           </div>
-          <h1>Enlace inválido</h1>
+          <h1>{errorTitle}</h1>
           <p className="subtitle">{errorMsg || COPY[flow].invalid}</p>
         </div>
       )}
