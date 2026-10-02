@@ -3,5 +3,8 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },
-  test: { environment: 'node', include: ['src/**/*.test.ts'] },
+  // tsconfig deja JSX en "preserve" para Next; los tests de la página lo necesitan compilado.
+  esbuild: { jsx: 'automatic' },
+  // La lógica corre en node; los tests de la página piden jsdom con un comentario de cabecera.
+  test: { environment: 'node', include: ['src/**/*.test.{ts,tsx}'] },
 });

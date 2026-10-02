@@ -199,15 +199,47 @@ function describeApiFailure(status: number, errorCode: unknown): ActivationError
   return 'unavailable';
 }
 
+// Diagnóstico del POST a activation-checkout: distingue un fallo de transporte
+// (el fetch ni siquiera devuelve respuesta: red, CORS, bloqueador… el navegador
+// no dice cuál) de una respuesta HTTP. Nunca lleva el JWT, la URL de Stripe ni
+// el cuerpo: solo la categoría, el status y un error_code con forma de código.
+export type CheckoutDiagnostic =
+  | { category: 'network' }
+  | { category: 'timeout' }
+  | { category: 'http'; status: number; error_code?: string }
+  | { category: 'invalid-response'; status: number };
+
+export type Diagnose = (diagnostic: CheckoutDiagnostic) => void;
+
+const ERROR_CODE_SHAPE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+function safeErrorCode(raw: unknown): string | undefined {
+  return typeof raw === 'string' && ERROR_CODE_SHAPE.test(raw) ? raw : undefined;
+}
+
+function report(diagnose: Diagnose | undefined, diagnostic: CheckoutDiagnostic): void {
+  try {
+    diagnose?.(diagnostic);
+  } catch {
+    // El diagnóstico nunca cambia el resultado de la activación.
+  }
+}
+
 async function requestCheckout(
   fetchFn: typeof fetch,
   accessToken: string,
-  interval: Interval
+  interval: Interval,
+  diagnose?: Diagnose
 ): Promise<{ url: string } | { error: ActivationError }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, API_TIMEOUT_MS);
+  let res: Response;
   try {
-    const res = await fetchFn(ACTIVATION_CHECKOUT_URL, {
+    res = await fetchFn(ACTIVATION_CHECKOUT_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -219,15 +251,30 @@ async function requestCheckout(
       redirect: 'error',
       signal: controller.signal,
     });
-    const body = await readJson(res);
-    if (!res.ok) return { error: describeApiFailure(res.status, body?.error_code) };
-    const url = stripeCheckoutUrl(body?.url);
-    return url ? { url } : { error: 'unavailable' };
   } catch {
+    // Un fetch rechazado no trae status: no se inventa ninguno.
+    report(diagnose, { category: timedOut ? 'timeout' : 'network' });
     return { error: 'unavailable' };
   } finally {
     clearTimeout(timer);
   }
+
+  const body = await readJson(res);
+  if (!res.ok) {
+    const errorCode = safeErrorCode(body?.error_code);
+    report(diagnose, {
+      category: 'http',
+      status: res.status,
+      ...(errorCode ? { error_code: errorCode } : {}),
+    });
+    return { error: describeApiFailure(res.status, body?.error_code) };
+  }
+  const url = stripeCheckoutUrl(body?.url);
+  if (!url) {
+    report(diagnose, { category: 'invalid-response', status: res.status });
+    return { error: 'unavailable' };
+  }
+  return { url };
 }
 
 /**
@@ -240,12 +287,13 @@ export async function startActivation(
   credentials: Credentials,
   interval: Interval,
   fetchFn: typeof fetch,
-  navigate: (url: string) => void
+  navigate: (url: string) => void,
+  diagnose?: Diagnose
 ): Promise<{ ok: true } | { ok: false; error: ActivationError }> {
   const session = await openSession(auth, credentials, 'magiclink');
   if (!session) return { ok: false, error: 'link' };
 
-  const result = await requestCheckout(fetchFn, session.access_token, interval);
+  const result = await requestCheckout(fetchFn, session.access_token, interval, diagnose);
   await closeSession(auth);
 
   if ('error' in result) return { ok: false, error: result.error };
@@ -256,6 +304,10 @@ export async function startActivation(
 // ---------------------------------------------------------------------------
 // Orquestación de una carga de página
 
+export type ActivationOutcome =
+  | { view: 'redirecting' }
+  | { view: 'activation-failed'; error: ActivationError };
+
 export type Outcome =
   | { view: 'form'; flow: PasswordFlow }
   | { view: 'password-link-expired'; flow: PasswordFlow }
@@ -263,8 +315,10 @@ export type Outcome =
   | { view: 'link-error'; activation: boolean }
   | { view: 'signup-confirmed' }
   | { view: 'signup-failed' }
-  | { view: 'redirecting' }
-  | { view: 'activation-failed'; error: ActivationError };
+  // Un enlace de activación válido no hace nada al cargar: los escáneres y
+  // previsualizadores de correo abren la URL, y verificar aquí gastaría el
+  // token. Solo `confirm()`, que llama el botón "Continuar al pago", lo usa.
+  | { view: 'activation-confirm'; interval: Interval; confirm: () => Promise<ActivationOutcome> };
 
 export interface BridgeEnv {
   href: string;
@@ -276,6 +330,33 @@ export interface BridgeEnv {
   ephemeralAuth: () => BridgeAuth;
   fetch: typeof fetch;
   navigate: (url: string) => void;
+  // Diagnóstico sin datos sensibles de la llamada a activation-checkout.
+  diagnose?: Diagnose;
+}
+
+/**
+ * La acción del botón "Continuar al pago". Las credenciales solo viven en este
+ * closure (ni estado de React ni URL). Una sola ejecución aunque se pulse dos
+ * veces: si falla no se reintenta, porque verificar ya ha gastado el enlace.
+ */
+function activationAction(
+  env: BridgeEnv,
+  credentials: Credentials,
+  interval: Interval
+): () => Promise<ActivationOutcome> {
+  let pending: Promise<ActivationOutcome> | null = null;
+  return () =>
+    (pending ??= startActivation(
+      env.ephemeralAuth(),
+      credentials,
+      interval,
+      env.fetch,
+      env.navigate,
+      env.diagnose
+    ).then(
+      (result): ActivationOutcome =>
+        result.ok ? { view: 'redirecting' } : { view: 'activation-failed', error: result.error }
+    ));
 }
 
 async function run(env: BridgeEnv): Promise<Outcome> {
@@ -298,17 +379,14 @@ async function run(env: BridgeEnv): Promise<Outcome> {
       return { view: ok ? 'signup-confirmed' : 'signup-failed' };
     }
     case 'activate': {
-      // Antes de cualquier espera: una recarga o volver atrás ya no traerá el
-      // enlace y no podrá abrir un segundo Checkout.
+      // La URL se limpia ya: recargar o volver atrás no la reutiliza, y lo
+      // necesario para el clic queda solo en memoria.
       env.clearUrl();
-      const result = await startActivation(
-        env.ephemeralAuth(),
-        landing.credentials,
-        landing.interval,
-        env.fetch,
-        env.navigate
-      );
-      return result.ok ? { view: 'redirecting' } : { view: 'activation-failed', error: result.error };
+      return {
+        view: 'activation-confirm',
+        interval: landing.interval,
+        confirm: activationAction(env, landing.credentials, landing.interval),
+      };
     }
     case 'link-error':
       return { view: 'link-error', activation: landing.activation };
@@ -323,7 +401,8 @@ async function run(env: BridgeEnv): Promise<Outcome> {
 /**
  * Una sola ejecución por carga de página, aunque el efecto se monte dos veces
  * (Strict Mode) o el componente se vuelva a montar: todas las llamadas
- * comparten el mismo resultado.
+ * comparten el mismo resultado. Para la activación ese resultado es la
+ * pantalla de confirmación, así que montar no verifica ni pide el Checkout.
  */
 export function createBridgeRunner(): (env: () => BridgeEnv) => Promise<Outcome> {
   let pending: Promise<Outcome> | null = null;
