@@ -3,7 +3,14 @@
 import Image from 'next/image';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { createEphemeralSupabase, getSupabase } from '@/lib/supabase';
-import { createBridgeRunner, type ActivationError, type PasswordFlow } from '@/lib/authBridge';
+import {
+  createBridgeRunner,
+  type ActivationError,
+  type ActivationOutcome,
+  type Interval,
+  type PasswordFlow,
+} from '@/lib/authBridge';
+import { leavePage } from '@/lib/navigation';
 
 const STRENGTH = [
   { pct: 0, color: '', label: '' },
@@ -13,7 +20,14 @@ const STRENGTH = [
   { pct: 100, color: '#1dba5d', label: 'Fuerte' },
 ];
 
-type State = 'loading' | 'form' | 'success' | 'error' | 'signup-confirmed' | 'redirecting';
+type State =
+  | 'loading'
+  | 'form'
+  | 'success'
+  | 'error'
+  | 'signup-confirmed'
+  | 'activation-confirm'
+  | 'redirecting';
 
 // Los dos flujos con contraseña que Supabase manda a este puente. El copy es lo
 // único que cambia entre ellos: en ambos casos la sesión llega en el hash y se
@@ -33,6 +47,8 @@ const SIGNUP_FAILED =
 const ACTIVATION_LINK =
   'El enlace de activación ha caducado, ya se ha usado o no es válido. Vuelve a pedirlo desde la pantalla Activar de la app.';
 
+const INTERVAL_LABEL: Record<Interval, string> = { month: 'Plan mensual', year: 'Plan anual' };
+
 // Ningún mensaje afirma que se haya pagado: aquí nunca se llega a pagar.
 const ACTIVATION_ERRORS: Record<ActivationError, string> = {
   link: ACTIVATION_LINK,
@@ -45,6 +61,15 @@ const ACTIVATION_ERRORS: Record<ActivationError, string> = {
     'Demasiados intentos seguidos. Espera unos minutos y vuelve a pedir el enlace desde la app.',
   unavailable:
     'No hemos podido abrir la página de pago y no se ha hecho ningún cobro. Vuelve a pedir el enlace desde la pantalla Activar de la app.',
+};
+
+const ACTIVATION_ERROR_TITLE: Record<ActivationError, string> = {
+  link: 'El enlace ya no sirve',
+  forbidden: 'No se ha podido abrir el pago',
+  'pending-deletion': 'No se ha podido abrir el pago',
+  'not-trial': 'No se ha podido abrir el pago',
+  'rate-limited': 'No se ha podido abrir el pago',
+  unavailable: 'No se ha podido abrir el pago',
 };
 
 const COPY: Record<Flow, { title: string; subtitle: string; expired: string; invalid: string; done: string }> = {
@@ -72,7 +97,6 @@ export default function AuthPage() {
   const [state, setState] = useState<State>('loading');
   const [flow, setFlow] = useState<Flow>('invite');
   const [errorMsg, setErrorMsg] = useState('');
-  const [errorTitle, setErrorTitle] = useState('Enlace inválido');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [showPw, setShowPw] = useState(false);
@@ -82,6 +106,13 @@ export default function AuthPage() {
   const [confirmError, setConfirmError] = useState('');
   const [loading, setLoading] = useState(false);
   const passwordRef = useRef<HTMLInputElement>(null);
+  const [interval, setActivationInterval] = useState<Interval>('month');
+  const [activating, setActivating] = useState(false);
+  // Error de un enlace de activación: ofrece volver a la pantalla Activar.
+  const [activationError, setActivationError] = useState<ActivationError | null>(null);
+  // La acción del botón "Continuar al pago" (guarda en memoria lo que el clic necesita).
+  const confirmActivation = useRef<(() => Promise<ActivationOutcome>) | null>(null);
+  const errorHeadingRef = useRef<HTMLHeadingElement>(null);
 
   const appScheme = process.env.NEXT_PUBLIC_APP_SCHEME || 'trazea';
 
@@ -106,7 +137,9 @@ export default function AuthPage() {
       passwordAuth: () => getSupabase().auth,
       ephemeralAuth: () => createEphemeralSupabase().auth,
       fetch: (...args) => window.fetch(...args),
-      navigate: (url) => window.location.replace(url),
+      navigate: leavePage,
+      // Sin tokens, URLs ni cuerpos: solo categoría, status y error_code.
+      diagnose: (d) => console.warn('[trazea-auth] activation-checkout', d),
     })).then((outcome) => {
       if (!active) return;
       switch (outcome.view) {
@@ -122,21 +155,20 @@ export default function AuthPage() {
         case 'signup-confirmed':
           setState('signup-confirmed');
           return;
-        case 'redirecting':
-          setState('redirecting');
+        case 'activation-confirm':
+          confirmActivation.current = outcome.confirm;
+          setActivationInterval(outcome.interval);
+          setState('activation-confirm');
           return;
         case 'signup-failed':
           setErrorMsg(SIGNUP_FAILED);
           break;
         case 'link-error':
-          setErrorMsg(outcome.activation ? ACTIVATION_LINK : LINK_USED);
+          if (outcome.activation) setActivationError('link');
+          else setErrorMsg(LINK_USED);
           break;
         case 'invalid':
-          if (outcome.activation) setErrorMsg(ACTIVATION_LINK);
-          break;
-        case 'activation-failed':
-          if (outcome.error !== 'link') setErrorTitle('No se ha podido abrir el pago');
-          setErrorMsg(ACTIVATION_ERRORS[outcome.error]);
+          if (outcome.activation) setActivationError('link');
           break;
       }
       setState('error');
@@ -145,6 +177,26 @@ export default function AuthPage() {
       active = false;
     };
   }, []);
+
+  // Lo único que verifica el enlace y pide el Checkout: el clic explícito.
+  const continueToPayment = async () => {
+    const action = confirmActivation.current;
+    if (!action || activating) return;
+    setActivating(true);
+    // `action` es de un solo uso: un doble clic devuelve la misma promesa.
+    const outcome = await action();
+    if (outcome.view === 'redirecting') {
+      setState('redirecting');
+      return;
+    }
+    setActivationError(outcome.error);
+    setActivating(false);
+    setState('error');
+  };
+
+  useEffect(() => {
+    if (state === 'error' && activationError) errorHeadingRef.current?.focus();
+  }, [state, activationError]);
 
   useEffect(() => {
     if (state === 'form') passwordRef.current?.focus();
@@ -422,6 +474,43 @@ export default function AuthPage() {
         </div>
       )}
 
+      {/* ACTIVACIÓN: confirmación (nada se verifica hasta pulsar) */}
+      {state === 'activation-confirm' && (
+        <div className="card">
+          <Image src="/logo.svg" alt="Trazea" width={120} height={32} className="logo" unoptimized />
+          <h1>Activa tu suscripción a Trazea</h1>
+          <p className="plan-pill">{INTERVAL_LABEL[interval]}</p>
+          <p className="subtitle">
+            Te llevamos a la página de pago segura de Stripe. Allí verás el precio, el IVA y la
+            factura antes de pagar; no se cobra nada hasta que confirmes.
+          </p>
+
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={continueToPayment}
+            disabled={activating}
+            aria-busy={activating}
+          >
+            {activating ? (
+              <>
+                <span className="spinner" aria-hidden="true" /> Abriendo el pago…
+              </>
+            ) : (
+              'Continuar al pago'
+            )}
+          </button>
+          <p className="sr-only" role="status" aria-live="polite">
+            {activating ? 'Abriendo la página de pago…' : ''}
+          </p>
+
+          <hr className="divider" />
+          <p className="note">
+            Cuando termines en Stripe, vuelve a la app: allí verás cuándo queda activada.
+          </p>
+        </div>
+      )}
+
       {/* ACTIVACIÓN: camino del Checkout */}
       {state === 'redirecting' && (
         <div className="card">
@@ -452,8 +541,25 @@ export default function AuthPage() {
               <line x1="12" y1="16" x2="12.01" y2="16" />
             </svg>
           </div>
-          <h1>{errorTitle}</h1>
-          <p className="subtitle">{errorMsg || COPY[flow].invalid}</p>
+          <h1 ref={errorHeadingRef} tabIndex={-1}>
+            {activationError ? ACTIVATION_ERROR_TITLE[activationError] : 'Enlace inválido'}
+          </h1>
+          <p className="subtitle" role={activationError ? 'alert' : undefined}>
+            {activationError ? ACTIVATION_ERRORS[activationError] : errorMsg || COPY[flow].invalid}
+          </p>
+
+          {activationError && (
+            <>
+              <a href={`${appScheme}://activate`} className="btn btn-primary">
+                Volver a Activar en la app
+              </a>
+              <hr className="divider" />
+              <p className="note">
+                Si el botón no abre la app, abre Trazea en tu móvil, entra en Activar Trazea y pide
+                un enlace nuevo. Usa solo el último email que recibas.
+              </p>
+            </>
+          )}
         </div>
       )}
 

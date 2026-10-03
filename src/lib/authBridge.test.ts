@@ -372,6 +372,100 @@ describe('startActivation', () => {
   });
 });
 
+describe('diagnóstico de activation-checkout', () => {
+  async function diagnoseWith(fetchFn: typeof fetch) {
+    const { typed } = fakeAuth();
+    const diagnose = vi.fn();
+    const result = await startActivation(typed, hashCreds, 'month', fetchFn, vi.fn(), diagnose);
+    const sent = JSON.stringify(diagnose.mock.calls);
+    expect(sent).not.toContain('SECRET');
+    expect(sent).not.toContain(ACTIVATION_CHECKOUT_URL);
+    expect(sent).not.toContain('checkout.stripe.com');
+    return { result, diagnose };
+  }
+
+  it('fetch rechazado (red, CORS…): categoría network, sin status ni causa inventados', async () => {
+    const { result, diagnose } = await diagnoseWith(
+      fakeFetch([], () => Promise.reject(new TypeError('Failed to fetch')))
+    );
+    expect(result).toEqual({ ok: false, error: 'unavailable' });
+    expect(diagnose).toHaveBeenCalledTimes(1);
+    expect(diagnose).toHaveBeenCalledWith({ category: 'network' });
+  });
+
+  it('la API no responde en plazo: categoría timeout', async () => {
+    vi.useFakeTimers();
+    const fetchFn = vi.fn(
+      (_: string, init: RequestInit) =>
+        new Promise<Response>((_, reject) =>
+          init.signal?.addEventListener('abort', () =>
+            reject(new DOMException('aborted', 'AbortError'))
+          )
+        )
+    ) as unknown as typeof fetch;
+    const { typed } = fakeAuth();
+    const diagnose = vi.fn();
+    const done = startActivation(typed, hashCreds, 'month', fetchFn, vi.fn(), diagnose);
+    await vi.advanceTimersByTimeAsync(20_000);
+    await expect(done).resolves.toEqual({ ok: false, error: 'unavailable' });
+    expect(diagnose).toHaveBeenCalledWith({ category: 'timeout' });
+  });
+
+  it.each([
+    [500, '<html>Internal Server Error SECRET</html>', { category: 'http', status: 500 }],
+    [503, { error_code: 'BillingProviderUnavailable', detail: 'stripe down SECRET' }, {
+      category: 'http',
+      status: 503,
+      error_code: 'BillingProviderUnavailable',
+    }],
+    [502, { error_code: '<script>alert(1)</script>' }, { category: 'http', status: 502 }],
+    [500, { error_code: `user@example.com ${AT}` }, { category: 'http', status: 500 }],
+    [500, { error_code: 42 }, { category: 'http', status: 500 }],
+    [403, { error_code: 'AccountPendingDeletion' }, {
+      category: 'http',
+      status: 403,
+      error_code: 'AccountPendingDeletion',
+    }],
+  ])('respuesta HTTP %i: status y error_code saneado, nunca el cuerpo', async (status, body, expected) => {
+    const { diagnose } = await diagnoseWith(fakeFetch([], () => jsonResponse(status, body)));
+    expect(diagnose).toHaveBeenCalledTimes(1);
+    expect(diagnose).toHaveBeenCalledWith(expected);
+    expect(JSON.stringify(diagnose.mock.calls)).not.toContain('detail');
+  });
+
+  it('200 sin Checkout válido: invalid-response, sin la URL recibida', async () => {
+    const { result, diagnose } = await diagnoseWith(
+      fakeFetch([], () => jsonResponse(200, { url: 'https://evil.example/c/pay/cs_SECRET' }))
+    );
+    expect(result).toEqual({ ok: false, error: 'unavailable' });
+    expect(diagnose).toHaveBeenCalledWith({ category: 'invalid-response', status: 200 });
+    expect(JSON.stringify(diagnose.mock.calls)).not.toContain('evil');
+  });
+
+  it('éxito: sin diagnóstico', async () => {
+    const { result, diagnose } = await diagnoseWith(
+      fakeFetch([], () => jsonResponse(200, { url: CHECKOUT }))
+    );
+    expect(result).toEqual({ ok: true });
+    expect(diagnose).not.toHaveBeenCalled();
+  });
+
+  it('un diagnóstico que lanza no cambia el resultado', async () => {
+    const { typed } = fakeAuth();
+    const result = await startActivation(
+      typed,
+      hashCreds,
+      'month',
+      fakeFetch([], () => jsonResponse(500, {})),
+      vi.fn(),
+      () => {
+        throw new Error('boom');
+      }
+    );
+    expect(result).toEqual({ ok: false, error: 'unavailable' });
+  });
+});
+
 describe('createBridgeRunner', () => {
   function env(href: string, overrides: Partial<BridgeEnv> = {}) {
     const calls: string[] = [];
@@ -393,36 +487,162 @@ describe('createBridgeRunner', () => {
   }
 
   const ACTIVATE = `${BASE}?next=activate&interval=month#${HASH_SESSION}&type=magiclink`;
+  const activateHash = (interval: string) =>
+    `${BASE}?next=activate&interval=${interval}#${HASH_SESSION}&type=magiclink`;
+  const activateTokenHash = (interval: string) =>
+    `${BASE}?next=activate&interval=${interval}&token_hash=h1&type=magiclink`;
 
-  it('dos montajes seguidos (Strict Mode) abren un único Checkout', async () => {
+  async function confirmView(e: BridgeEnv, run = createBridgeRunner()) {
+    const outcome = await run(() => e);
+    if (outcome.view !== 'activation-confirm') throw new Error(`vista inesperada: ${outcome.view}`);
+    return outcome;
+  }
+
+  function expectUntouched(e: BridgeEnv, ephemeral: ReturnType<typeof fakeAuth>) {
+    expect(e.ephemeralAuth).not.toHaveBeenCalled();
+    expect(ephemeral.auth.verifyOtp).not.toHaveBeenCalled();
+    expect(ephemeral.auth.setSession).not.toHaveBeenCalled();
+    expect(ephemeral.auth.signOut).not.toHaveBeenCalled();
+    expect(e.fetch).not.toHaveBeenCalled();
+    expect(e.navigate).not.toHaveBeenCalled();
+  }
+
+  describe.each([
+    ['token_hash', activateTokenHash],
+    ['sesión en el hash (enlace antiguo)', activateHash],
+  ])('activación con %s', (_, href) => {
+    it.each(['month', 'year'] as const)(
+      '%s: cargar solo muestra la confirmación, sin consumir el enlace',
+      async (interval) => {
+        const { e, ephemeral, password } = env(href(interval));
+        const outcome = await confirmView(e);
+        expect(outcome.interval).toBe(interval);
+        expect(e.clearUrl).toHaveBeenCalledTimes(1);
+        expectUntouched(e, ephemeral);
+        expect(e.passwordAuth).not.toHaveBeenCalled();
+        expect(password.auth.setSession).not.toHaveBeenCalled();
+        // Las credenciales no viajan en el resultado serializable.
+        expect(JSON.stringify(outcome)).not.toContain('SECRET');
+        expect(JSON.stringify(outcome)).not.toContain('h1');
+      }
+    );
+
+    it.each(['month', 'year'] as const)(
+      '%s: el clic verifica, pide el Checkout de ese intervalo, cierra y navega',
+      async (interval) => {
+        const { e, calls, ephemeral } = env(href(interval));
+        const { confirm } = await confirmView(e);
+        await expect(confirm()).resolves.toEqual({ view: 'redirecting' });
+        const open =
+          href === activateTokenHash ? ephemeral.auth.verifyOtp : ephemeral.auth.setSession;
+        // Orden: verificar → API → cerrar la sesión → navegar.
+        const order = [
+          e.ephemeralAuth,
+          open,
+          e.fetch,
+          ephemeral.auth.signOut,
+          e.navigate,
+        ].map((fn) => (fn as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]);
+        expect(order.every((n) => n !== undefined)).toBe(true);
+        expect([...order].sort((x, y) => x - y)).toEqual(order);
+        expect(calls).toEqual(['clearUrl', 'ephemeralAuth', 'fetch', `navigate:${CHECKOUT}`]);
+        const [, init] = (e.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [
+          string,
+          RequestInit,
+        ];
+        expect(JSON.parse(init.body as string)).toEqual({ interval });
+        expect(ephemeral.auth.signOut).toHaveBeenCalledWith({ scope: 'local' });
+      }
+    );
+  });
+
+  it('el clic con token_hash usa verifyOtp tipo magiclink y nunca setSession', async () => {
+    const { e, ephemeral } = env(activateTokenHash('year'));
+    await (await confirmView(e)).confirm();
+    expect(ephemeral.auth.verifyOtp).toHaveBeenCalledWith({ token_hash: 'h1', type: 'magiclink' });
+    expect(ephemeral.auth.setSession).not.toHaveBeenCalled();
+  });
+
+  it('Strict Mode + doble clic: una sola verificación, un POST y una navegación', async () => {
     const run = createBridgeRunner();
-    const { e, ephemeral } = env(ACTIVATE);
+    const { e, ephemeral } = env(activateTokenHash('month'));
     const factory = vi.fn(() => e);
     const [a, b] = await Promise.all([run(factory), run(factory)]);
-    const c = await run(factory);
-    expect(a).toEqual({ view: 'redirecting' });
     expect(b).toBe(a);
-    expect(c).toBe(a);
     expect(factory).toHaveBeenCalledTimes(1);
-    expect(ephemeral.auth.setSession).toHaveBeenCalledTimes(1);
+    expectUntouched(e, ephemeral);
+    if (a.view !== 'activation-confirm') throw new Error(a.view);
+
+    const [r1, r2] = await Promise.all([a.confirm(), a.confirm()]);
+    const r3 = await a.confirm();
+    expect(r1).toEqual({ view: 'redirecting' });
+    expect(r2).toBe(r1);
+    expect(r3).toBe(r1);
+    expect(e.ephemeralAuth).toHaveBeenCalledTimes(1);
+    expect(ephemeral.auth.verifyOtp).toHaveBeenCalledTimes(1);
     expect(e.fetch).toHaveBeenCalledTimes(1);
     expect(e.navigate).toHaveBeenCalledTimes(1);
   });
 
-  it('activación: borra la URL antes de verificar y no toca el cliente persistente', async () => {
+  it('un fallo tampoco se reintenta en el segundo clic (el enlace ya está gastado)', async () => {
+    const { e } = env(activateTokenHash('month'), {
+      fetch: fakeFetch([], () => jsonResponse(503, {})),
+    });
+    const { confirm } = await confirmView(e);
+    await expect(confirm()).resolves.toEqual({ view: 'activation-failed', error: 'unavailable' });
+    await confirm();
+    expect(e.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('token caducado o ya usado al pulsar: error de enlace, sin POST ni navegación', async () => {
+    const ephemeral = fakeAuth({
+      open: { data: { session: null }, error: { status: 403, code: 'otp_expired' } },
+    });
+    const { e } = env(activateTokenHash('year'), { ephemeralAuth: vi.fn(() => ephemeral.typed) });
+    const { confirm } = await confirmView(e);
+    await expect(confirm()).resolves.toEqual({ view: 'activation-failed', error: 'link' });
+    expect(e.fetch).not.toHaveBeenCalled();
+    expect(e.navigate).not.toHaveBeenCalled();
+  });
+
+  it('hash otp_expired con next=activate: error de activación, sin Supabase ni API', async () => {
+    const { e, ephemeral } = env(
+      `${BASE}?next=activate&interval=month#error=access_denied&error_code=otp_expired&error_description=Email+link+is+invalid+or+has+expired`
+    );
+    await expect(createBridgeRunner()(() => e)).resolves.toEqual({
+      view: 'link-error',
+      activation: true,
+    });
+    expectUntouched(e, ephemeral);
+  });
+
+  it('activación: borra la URL al cargar y no toca el cliente persistente', async () => {
     const { e, calls } = env(ACTIVATE);
-    await createBridgeRunner()(() => e);
-    expect(calls.slice(0, 2)).toEqual(['clearUrl', 'ephemeralAuth']);
+    await confirmView(e);
+    expect(calls).toEqual(['clearUrl']);
     expect(e.passwordAuth).not.toHaveBeenCalled();
-    expect(e.navigate).toHaveBeenCalledWith(CHECKOUT);
   });
 
   it('activación fallida en la API: resultado de error sin tokens', async () => {
     const { e } = env(ACTIVATE, { fetch: fakeFetch([], () => jsonResponse(503, {})) });
-    const outcome = await createBridgeRunner()(() => e);
+    const outcome = await (await confirmView(e)).confirm();
     expect(outcome).toEqual({ view: 'activation-failed', error: 'unavailable' });
     expect(JSON.stringify(outcome)).not.toContain('SECRET');
     expect(e.navigate).not.toHaveBeenCalled();
+  });
+
+  it('el diagnóstico llega desde el entorno de la página', async () => {
+    const diagnose = vi.fn();
+    const { e } = env(ACTIVATE, {
+      fetch: fakeFetch([], () => jsonResponse(502, { error_code: 'BillingProviderUnavailable' })),
+      diagnose,
+    });
+    await (await confirmView(e)).confirm();
+    expect(diagnose).toHaveBeenCalledWith({
+      category: 'http',
+      status: 502,
+      error_code: 'BillingProviderUnavailable',
+    });
   });
 
   it('magiclink sin next=activate: rechazado sin llamar a Supabase ni a la API', async () => {
