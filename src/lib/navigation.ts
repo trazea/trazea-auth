@@ -3,3 +3,8 @@
 export function leavePage(url: string): void {
   window.location.replace(url);
 }
+
+// Reintenta un enlace que no se pudo comprobar: el de invite/recovery sigue en la URL.
+export function reloadPage(): void {
+  window.location.reload();
+}

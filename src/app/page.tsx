@@ -10,7 +10,7 @@ import {
   type Interval,
   type PasswordFlow,
 } from '@/lib/authBridge';
-import { leavePage } from '@/lib/navigation';
+import { leavePage, reloadPage } from '@/lib/navigation';
 
 const STRENGTH = [
   { pct: 0, color: '', label: '' },
@@ -47,6 +47,13 @@ const SIGNUP_FAILED =
 const ACTIVATION_LINK =
   'El enlace de activación ha caducado, ya se ha usado o no es válido. Vuelve a pedirlo desde la pantalla Activar de la app.';
 
+// No se pudo comprobar el enlace (red, Supabase…): reintentar puede bastar.
+const CHECK_FAILED_TITLE = 'No hemos podido comprobar el enlace';
+
+// Última barrera ante un fallo inesperado: no se sabe de qué enlace se trataba.
+const UNEXPECTED_ERROR =
+  'Algo ha fallado al abrir este enlace. Vuelve a intentarlo. Si sigue sin funcionar, abre la app Trazea y pide un enlace nuevo.';
+
 const INTERVAL_LABEL: Record<Interval, string> = { month: 'Plan mensual', year: 'Plan anual' };
 
 // Ningún mensaje afirma que se haya pagado: aquí nunca se llega a pagar.
@@ -72,7 +79,10 @@ const ACTIVATION_ERROR_TITLE: Record<ActivationError, string> = {
   unavailable: 'No se ha podido abrir el pago',
 };
 
-const COPY: Record<Flow, { title: string; subtitle: string; expired: string; invalid: string; done: string }> = {
+const COPY: Record<
+  Flow,
+  { title: string; subtitle: string; expired: string; invalid: string; unavailable: string; done: string }
+> = {
   invite: {
     title: 'Crea tu contraseña',
     subtitle: 'Has sido invitado a Trazea. Elige una contraseña para activar tu cuenta.',
@@ -80,6 +90,8 @@ const COPY: Record<Flow, { title: string; subtitle: string; expired: string; inv
       'El enlace de invitación ha expirado. Contacta con el administrador para solicitar uno nuevo.',
     invalid:
       'El enlace de invitación ha expirado o no es válido. Contacta con el administrador para solicitar una nueva invitación.',
+    unavailable:
+      'No hemos podido comprobar tu invitación; puede ser un problema de conexión. Vuelve a intentarlo. Si sigue sin funcionar, contacta con el administrador para solicitar una nueva invitación.',
     done: 'Tu cuenta está lista. Abre la app Trazea en tu móvil para acceder.',
   },
   recovery: {
@@ -89,6 +101,8 @@ const COPY: Record<Flow, { title: string; subtitle: string; expired: string; inv
       'El enlace para restablecer la contraseña ha expirado. Pide uno nuevo desde la pantalla de acceso de la app.',
     invalid:
       'El enlace para restablecer la contraseña ha expirado o no es válido. Pide uno nuevo desde la pantalla de acceso de la app.',
+    unavailable:
+      'No hemos podido comprobar el enlace; puede ser un problema de conexión. Vuelve a intentarlo. Si sigue sin funcionar, pide uno nuevo desde la pantalla de acceso de la app.',
     done: 'Tu contraseña se ha actualizado. Abre la app Trazea en tu móvil para entrar.',
   },
 };
@@ -110,6 +124,8 @@ export default function AuthPage() {
   const [activating, setActivating] = useState(false);
   // Error de un enlace de activación: ofrece volver a la pantalla Activar.
   const [activationError, setActivationError] = useState<ActivationError | null>(null);
+  // Error que se puede reintentar recargando: ofrece Reintentar y volver a la app.
+  const [retryError, setRetryError] = useState<string | null>(null);
   // La acción del botón "Continuar al pago" (guarda en memoria lo que el clic necesita).
   const confirmActivation = useRef<(() => Promise<ActivationOutcome>) | null>(null);
   const errorHeadingRef = useRef<HTMLHeadingElement>(null);
@@ -152,6 +168,11 @@ export default function AuthPage() {
           setErrorMsg(COPY[outcome.flow].expired);
           setState('error');
           return;
+        case 'password-check-failed':
+          setFlow(outcome.flow);
+          setRetryError(COPY[outcome.flow].unavailable);
+          setState('error');
+          return;
         case 'signup-confirmed':
           setState('signup-confirmed');
           return;
@@ -171,6 +192,11 @@ export default function AuthPage() {
           if (outcome.activation) setActivationError('link');
           break;
       }
+      setState('error');
+    }).catch(() => {
+      // Sin registrar el error: podría llevar datos del enlace.
+      if (!active) return;
+      setRetryError(UNEXPECTED_ERROR);
       setState('error');
     });
     return () => {
@@ -195,8 +221,8 @@ export default function AuthPage() {
   };
 
   useEffect(() => {
-    if (state === 'error' && activationError) errorHeadingRef.current?.focus();
-  }, [state, activationError]);
+    if (state === 'error' && (activationError || retryError)) errorHeadingRef.current?.focus();
+  }, [state, activationError, retryError]);
 
   useEffect(() => {
     if (state === 'form') passwordRef.current?.focus();
@@ -217,7 +243,12 @@ export default function AuthPage() {
 
     setLoading(true);
 
-    const { error } = await getSupabase().auth.updateUser({ password });
+    let error: unknown;
+    try {
+      ({ error } = await getSupabase().auth.updateUser({ password }));
+    } catch (e) {
+      error = e;
+    }
 
     if (error) {
       setLoading(false);
@@ -542,11 +573,33 @@ export default function AuthPage() {
             </svg>
           </div>
           <h1 ref={errorHeadingRef} tabIndex={-1}>
-            {activationError ? ACTIVATION_ERROR_TITLE[activationError] : 'Enlace inválido'}
+            {activationError
+              ? ACTIVATION_ERROR_TITLE[activationError]
+              : retryError
+                ? CHECK_FAILED_TITLE
+                : 'Enlace inválido'}
           </h1>
-          <p className="subtitle" role={activationError ? 'alert' : undefined}>
-            {activationError ? ACTIVATION_ERRORS[activationError] : errorMsg || COPY[flow].invalid}
+          <p className="subtitle" role={activationError || retryError ? 'alert' : undefined}>
+            {activationError
+              ? ACTIVATION_ERRORS[activationError]
+              : retryError || errorMsg || COPY[flow].invalid}
           </p>
+
+          {!activationError && retryError && (
+            <>
+              <button type="button" className="btn btn-primary" onClick={reloadPage}>
+                Reintentar
+              </button>
+              <a href={`${appScheme}://`} className="btn btn-green">
+                Abrir Trazea
+              </a>
+              <hr className="divider" />
+              <p className="note">
+                Si el botón no abre la app, busca &quot;Trazea&quot; en tu móvil y ábrela
+                directamente.
+              </p>
+            </>
+          )}
 
           {activationError && (
             <>
