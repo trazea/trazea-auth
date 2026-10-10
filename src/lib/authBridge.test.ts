@@ -1,3 +1,4 @@
+import { AuthRetryableFetchError } from '@supabase/supabase-js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ACTIVATION_CHECKOUT_URL,
@@ -705,5 +706,89 @@ describe('createBridgeRunner', () => {
     const password = fakeAuth({ open: { data: { session: null }, error: { status: 401 } } });
     const { e } = env(`${BASE}#${HASH_SESSION}&type=${flow}`, { passwordAuth: () => password.typed });
     await expect(createBridgeRunner()(() => e)).resolves.toEqual({ view: 'password-link-expired', flow });
+  });
+
+  describe.each(['invite', 'recovery'] as const)('%s: setSession sin respuesta válida', (flow) => {
+    const href = `${BASE}#${HASH_SESSION}&type=${flow}`;
+
+    it('setSession lanza: error reintentable, sin formulario ni tokens', async () => {
+      const password = fakeAuth({ open: new Error(`fetch failed for ${AT}`) });
+      const { e } = env(href, { passwordAuth: () => password.typed });
+      const outcome = await createBridgeRunner()(() => e);
+      expect(outcome).toMatchObject({ view: 'password-check-failed', flow });
+      expect(JSON.stringify(outcome)).not.toContain('SECRET');
+    });
+
+    it('reintentar usa los tokens en memoria aunque la URL ya no los lleve', async () => {
+      let calls = 0;
+      const setSession = vi.fn(async () => {
+        if (++calls === 1) throw new Error('Failed to fetch');
+        return { data: { session: session() }, error: null };
+      });
+      const { e } = env(href, {
+        passwordAuth: () => ({ setSession }) as unknown as BridgeAuth,
+      });
+      const outcome = await createBridgeRunner()(() => e);
+      if (outcome.view !== 'password-check-failed') throw new Error(`vista inesperada: ${outcome.view}`);
+      // Lo que haga el SDK con el hash no importa: el reintento no lo vuelve a leer.
+      e.href = BASE;
+      await expect(outcome.retry()).resolves.toEqual({ view: 'form', flow });
+      expect(setSession).toHaveBeenCalledTimes(2);
+      expect(setSession).toHaveBeenLastCalledWith({ access_token: AT, refresh_token: RT });
+    });
+
+    it('un reintento que vuelve a fallar ofrece otro reintento', async () => {
+      const password = fakeAuth({ open: new Error('Failed to fetch') });
+      const { e } = env(href, { passwordAuth: () => password.typed });
+      const outcome = await createBridgeRunner()(() => e);
+      if (outcome.view !== 'password-check-failed') throw new Error(`vista inesperada: ${outcome.view}`);
+      await expect(outcome.retry()).resolves.toMatchObject({ view: 'password-check-failed', flow });
+    });
+
+    it('crear el cliente lanza: error reintentable', async () => {
+      const { e } = env(href, {
+        passwordAuth: () => {
+          throw new Error('supabaseUrl is required.');
+        },
+      });
+      await expect(createBridgeRunner()(() => e)).resolves.toMatchObject({
+        view: 'password-check-failed',
+        flow,
+      });
+    });
+
+    it('error de red devuelto por Supabase: reintentable, no "caducado"', async () => {
+      const password = fakeAuth({
+        open: { data: { session: null }, error: new AuthRetryableFetchError('Failed to fetch', 0) },
+      });
+      const { e } = env(href, { passwordAuth: () => password.typed });
+      await expect(createBridgeRunner()(() => e)).resolves.toMatchObject({
+        view: 'password-check-failed',
+        flow,
+      });
+    });
+
+    it('sin error pero sin sesión: nunca el formulario', async () => {
+      const password = fakeAuth({ open: { data: { session: null }, error: null } });
+      const { e } = env(href, { passwordAuth: () => password.typed });
+      await expect(createBridgeRunner()(() => e)).resolves.toEqual({
+        view: 'password-link-expired',
+        flow,
+      });
+    });
+  });
+
+  it('activación: si el clic lanza algo inesperado, error controlado y sin reintento', async () => {
+    const { e } = env(activateTokenHash('month'), {
+      ephemeralAuth: () => {
+        throw new Error(`supabaseUrl is required. ${AT}`);
+      },
+    });
+    const { confirm } = await confirmView(e);
+    const failed = { view: 'activation-failed', error: 'unavailable' };
+    await expect(confirm()).resolves.toEqual(failed);
+    await expect(confirm()).resolves.toEqual(failed);
+    expect(e.fetch).not.toHaveBeenCalled();
+    expect(e.navigate).not.toHaveBeenCalled();
   });
 });
