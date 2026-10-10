@@ -292,8 +292,13 @@ describe('AuthPage — fallos al comprobar el enlace', () => {
     expectSafeErrorView(container, spies);
 
     expect(screen.getByRole('link', { name: 'Abrir Trazea' }).getAttribute('href')).toBe('trazea://');
+
+    // Reintentar vuelve a comprobar con los tokens en memoria, sin recargar.
+    passwordAuth.setSession.mockResolvedValue({ data: { session: SESSION }, error: null });
     fireEvent.click(screen.getByRole('button', { name: 'Reintentar' }));
-    expect(reloadPage).toHaveBeenCalledTimes(1);
+    expect(await screen.findByLabelText('Contraseña')).toBeTruthy();
+    expect(passwordAuth.setSession).toHaveBeenCalledTimes(2);
+    expect(reloadPage).not.toHaveBeenCalled();
   });
 
   it('error de red devuelto por Supabase: reintento, no "enlace caducado"', async () => {
@@ -330,5 +335,8 @@ describe('AuthPage — fallos al comprobar el enlace', () => {
     expect(screen.getByRole('button', { name: 'Reintentar' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Abrir Trazea' })).toBeTruthy();
     expectSafeErrorView(container, spies);
+    // Sin reintento propio: no se sabe qué enlace era, así que recarga.
+    fireEvent.click(screen.getByRole('button', { name: 'Reintentar' }));
+    expect(reloadPage).toHaveBeenCalledTimes(1);
   });
 });

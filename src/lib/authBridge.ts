@@ -316,8 +316,9 @@ export type ActivationOutcome =
 export type Outcome =
   | { view: 'form'; flow: PasswordFlow }
   | { view: 'password-link-expired'; flow: PasswordFlow }
-  // No se pudo comprobar el enlace (red, SDK…): puede seguir siendo válido.
-  | { view: 'password-check-failed'; flow: PasswordFlow }
+  // No se pudo comprobar el enlace (red, SDK…): puede seguir siendo válido, y
+  // `retry` lo vuelve a intentar con los tokens en memoria.
+  | { view: 'password-check-failed'; flow: PasswordFlow; retry: () => Promise<Outcome> }
   | { view: 'invalid'; activation: boolean }
   | { view: 'link-error'; activation: boolean }
   | { view: 'signup-confirmed' }
@@ -371,29 +372,47 @@ function activationAction(
   return () => (pending ??= attempt());
 }
 
+/**
+ * Abre la sesión de invite/recovery en el cliente persistente. Reintentar no
+ * recarga: con detectSessionInUrl, el SDK valida el hash al crearse y lo borra
+ * si va bien, así que cuando falla setSession la URL puede no llevar ya el
+ * enlace. Los tokens solo viven en este closure.
+ */
+async function openPasswordSession(
+  env: BridgeEnv,
+  flow: PasswordFlow,
+  tokens: { access_token: string; refresh_token: string }
+): Promise<Outcome> {
+  const checkFailed = (): Outcome => ({
+    view: 'password-check-failed',
+    flow,
+    retry: () => openPasswordSession(env, flow, tokens),
+  });
+  // El error no sale de aquí: su mensaje podría llevar datos del enlace.
+  let result: AuthResponse;
+  try {
+    result = await env.passwordAuth().setSession(tokens);
+  } catch {
+    return checkFailed();
+  }
+  const { data, error } = result;
+  // El formulario solo con una sesión real: updateUser la necesita.
+  if (!error && data.session) return { view: 'form', flow };
+  // Supabase devuelve (no lanza) los fallos de red y los 502/503/504.
+  if (isAuthRetryableFetchError(error)) return checkFailed();
+  return { view: 'password-link-expired', flow };
+}
+
 async function run(env: BridgeEnv): Promise<Outcome> {
   const landing = parseLanding(env.href);
 
   switch (landing.flow) {
     case 'invite':
-    case 'recovery': {
-      // El error no sale de aquí: su mensaje podría llevar datos del enlace.
-      let result: AuthResponse;
-      try {
-        result = await env.passwordAuth().setSession({
-          access_token: landing.access_token,
-          refresh_token: landing.refresh_token,
-        });
-      } catch {
-        return { view: 'password-check-failed', flow: landing.flow };
-      }
-      const { data, error } = result;
-      // El formulario solo con una sesión real: updateUser la necesita.
-      if (!error && data.session) return { view: 'form', flow: landing.flow };
-      // Supabase devuelve (no lanza) los fallos de red y los 502/503/504.
-      if (isAuthRetryableFetchError(error)) return { view: 'password-check-failed', flow: landing.flow };
-      return { view: 'password-link-expired', flow: landing.flow };
-    }
+    case 'recovery':
+      return openPasswordSession(env, landing.flow, {
+        access_token: landing.access_token,
+        refresh_token: landing.refresh_token,
+      });
     case 'signup': {
       env.clearUrl();
       const ok = await confirmSignup(env.ephemeralAuth(), landing.credentials);

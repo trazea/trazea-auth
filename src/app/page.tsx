@@ -8,6 +8,7 @@ import {
   type ActivationError,
   type ActivationOutcome,
   type Interval,
+  type Outcome,
   type PasswordFlow,
 } from '@/lib/authBridge';
 import { leavePage, reloadPage } from '@/lib/navigation';
@@ -124,8 +125,10 @@ export default function AuthPage() {
   const [activating, setActivating] = useState(false);
   // Error de un enlace de activación: ofrece volver a la pantalla Activar.
   const [activationError, setActivationError] = useState<ActivationError | null>(null);
-  // Error que se puede reintentar recargando: ofrece Reintentar y volver a la app.
+  // Error que se puede reintentar: ofrece Reintentar y volver a la app.
   const [retryError, setRetryError] = useState<string | null>(null);
+  // Reintento en memoria de invite/recovery; sin él, Reintentar recarga la página.
+  const retryCheck = useRef<(() => Promise<Outcome>) | null>(null);
   // La acción del botón "Continuar al pago" (guarda en memoria lo que el clic necesita).
   const confirmActivation = useRef<(() => Promise<ActivationOutcome>) | null>(null);
   const errorHeadingRef = useRef<HTMLHeadingElement>(null);
@@ -145,6 +148,52 @@ export default function AuthPage() {
     setStrength(calcStrength(password));
   }, [password, calcStrength]);
 
+  const showOutcome = useCallback((outcome: Outcome) => {
+    switch (outcome.view) {
+      case 'form':
+        setFlow(outcome.flow);
+        setState('form');
+        return;
+      case 'password-link-expired':
+        setFlow(outcome.flow);
+        setErrorMsg(COPY[outcome.flow].expired);
+        setState('error');
+        return;
+      case 'password-check-failed':
+        setFlow(outcome.flow);
+        retryCheck.current = outcome.retry;
+        setRetryError(COPY[outcome.flow].unavailable);
+        setState('error');
+        return;
+      case 'signup-confirmed':
+        setState('signup-confirmed');
+        return;
+      case 'activation-confirm':
+        confirmActivation.current = outcome.confirm;
+        setActivationInterval(outcome.interval);
+        setState('activation-confirm');
+        return;
+      case 'signup-failed':
+        setErrorMsg(SIGNUP_FAILED);
+        break;
+      case 'link-error':
+        if (outcome.activation) setActivationError('link');
+        else setErrorMsg(LINK_USED);
+        break;
+      case 'invalid':
+        if (outcome.activation) setActivationError('link');
+        break;
+    }
+    setState('error');
+  }, []);
+
+  // Última barrera: sin registrar el error, que podría llevar datos del enlace.
+  const showUnexpectedError = useCallback(() => {
+    retryCheck.current = null;
+    setRetryError(UNEXPECTED_ERROR);
+    setState('error');
+  }, []);
+
   useEffect(() => {
     let active = true;
     runBridge(() => ({
@@ -156,53 +205,28 @@ export default function AuthPage() {
       navigate: leavePage,
       // Sin tokens, URLs ni cuerpos: solo categoría, status y error_code.
       diagnose: (d) => console.warn('[trazea-auth] activation-checkout', d),
-    })).then((outcome) => {
-      if (!active) return;
-      switch (outcome.view) {
-        case 'form':
-          setFlow(outcome.flow);
-          setState('form');
-          return;
-        case 'password-link-expired':
-          setFlow(outcome.flow);
-          setErrorMsg(COPY[outcome.flow].expired);
-          setState('error');
-          return;
-        case 'password-check-failed':
-          setFlow(outcome.flow);
-          setRetryError(COPY[outcome.flow].unavailable);
-          setState('error');
-          return;
-        case 'signup-confirmed':
-          setState('signup-confirmed');
-          return;
-        case 'activation-confirm':
-          confirmActivation.current = outcome.confirm;
-          setActivationInterval(outcome.interval);
-          setState('activation-confirm');
-          return;
-        case 'signup-failed':
-          setErrorMsg(SIGNUP_FAILED);
-          break;
-        case 'link-error':
-          if (outcome.activation) setActivationError('link');
-          else setErrorMsg(LINK_USED);
-          break;
-        case 'invalid':
-          if (outcome.activation) setActivationError('link');
-          break;
-      }
-      setState('error');
-    }).catch(() => {
-      // Sin registrar el error: podría llevar datos del enlace.
-      if (!active) return;
-      setRetryError(UNEXPECTED_ERROR);
-      setState('error');
-    });
+    })).then(
+      (outcome) => active && showOutcome(outcome),
+      () => active && showUnexpectedError()
+    );
     return () => {
       active = false;
     };
-  }, []);
+  }, [showOutcome, showUnexpectedError]);
+
+  // Invite/recovery reintentan con los tokens en memoria (la URL puede no
+  // llevarlos ya); un fallo sin reintento propio recarga la página.
+  const retry = () => {
+    const check = retryCheck.current;
+    if (!check) {
+      reloadPage();
+      return;
+    }
+    retryCheck.current = null;
+    setRetryError(null);
+    setState('loading');
+    check().then(showOutcome, showUnexpectedError);
+  };
 
   // Lo único que verifica el enlace y pide el Checkout: el clic explícito.
   const continueToPayment = async () => {
@@ -587,7 +611,7 @@ export default function AuthPage() {
 
           {!activationError && retryError && (
             <>
-              <button type="button" className="btn btn-primary" onClick={reloadPage}>
+              <button type="button" className="btn btn-primary" onClick={retry}>
                 Reintentar
               </button>
               <a href={`${appScheme}://`} className="btn btn-green">
